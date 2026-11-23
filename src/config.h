@@ -25,10 +25,13 @@
 #ifndef ANNOUNCE_INTERVAL_MS
 #define ANNOUNCE_INTERVAL_MS (360UL * 60UL * 1000UL)
 #endif
-// Minimum gap between announces triggered by TCP reconnects. Avoids flooding
-// the network on a flaky connection; the transport node keeps the path anyway.
-#ifndef RECONNECT_ANNOUNCE_MIN_MS
-#define RECONNECT_ANNOUNCE_MIN_MS (5UL * 60UL * 1000UL)
+// Minimum gap between automatic announces (boot, TCP reconnect). Transport
+// nodes rate-limit announces per destination (typically ~1 per hour) and stop
+// rebroadcasting them for a while if a destination announces too often. The
+// time of the last announce is persisted, so reboots respect the gap too.
+// Clients can still reach the node in between via path requests.
+#ifndef ANNOUNCE_MIN_GAP_MS
+#define ANNOUNCE_MIN_GAP_MS (60UL * 60UL * 1000UL)
 #endif
 
 // --- Interfaces -------------------------------------------------------------
@@ -53,6 +56,16 @@
 
 #ifndef WIFI_RETRY_MS
 #define WIFI_RETRY_MS (30UL * 1000UL)
+#endif
+
+// NTP servers. Real time is required: announces carry an emission timestamp
+// and Python RNS transport nodes drop announces that aren't newer than the
+// last one they've seen from a destination.
+#ifndef NTP_SERVER_1
+#define NTP_SERVER_1 "pool.ntp.org"
+#endif
+#ifndef NTP_SERVER_2
+#define NTP_SERVER_2 "time.cloudflare.com"
 #endif
 
 // --- Pages ------------------------------------------------------------------

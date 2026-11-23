@@ -84,7 +84,9 @@ All options live in `src/secrets.h` (git-ignored); defaults are in
 | `NODE_NAME` | `madpico` | name shown in NomadNet |
 | `USE_TCP` / `USE_UDP` | 1 / 0 | enable interfaces |
 | `UDP_PORT` | 4242 | UDP broadcast port |
-| `ANNOUNCE_INTERVAL_MS` | 6 h | periodic announce (plus one after each TCP connect) |
+| `ANNOUNCE_INTERVAL_MS` | 6 h | periodic announce |
+| `ANNOUNCE_MIN_GAP_MS` | 1 h | minimum gap for automatic announces (boot, TCP reconnect), persisted across reboots |
+| `NTP_SERVER_1` / `NTP_SERVER_2` | `pool.ntp.org` / `time.cloudflare.com` | time source (required, see below) |
 | `STATUS_SHOW_NETWORK` | 0 | show SSID and local IP on the status page |
 | `MAX_PAGE_SIZE` | 16 KB | largest page served / accepted for upload |
 | `MAX_ACTIVE_LINKS` | 16 | links beyond this close the longest idle ones |
@@ -140,13 +142,26 @@ Single characters typed into the serial console:
 
 | Key | Action |
 |---|---|
-| `a` | announce now |
+| `a` | announce now (use sparingly, see below) |
 | `s` | print status (heap, links, connections) |
 | `w` | scan WiFi networks |
 | `c` | reconnect WiFi |
 | `r` | rewrite the default pages and reboot |
 
 LED: on = online, slow blink = WiFi ok but TCP disconnected, fast blink = no WiFi.
+
+### Announces and rate limits
+
+Transport nodes rate-limit announces per destination (typically about one
+per hour). A node that announces too often has its announces silently
+dropped for a while: they are no longer rebroadcast, so it doesn't show up
+in other people's NomadNet announce lists. Path requests still work, so the
+node stays reachable by address (`<address>:/page/index.mu`).
+
+madpico therefore announces every 6 hours and on boot / TCP reconnect only if
+the last announce is at least an hour old. The time of the last announce is
+stored in flash, so frequent reboots (e.g. while developing) don't cause extra
+announces. Avoid pressing `a` repeatedly.
 
 ## Testing
 
@@ -167,6 +182,13 @@ microReticulum on the RP2350:
   RP2xxx, so the RNG starts from the same state on every boot and every
   device would generate the same keys. `src/PicoEntropy.h` feeds the RP2350
   TRNG into the RNG as a noise source.
+- **Clock:** without an RTC, microReticulum's time is "milliseconds since
+  boot + persisted offset", i.e. 1970, and it jumps back by up to 10 minutes
+  after a reboot because the offset is only persisted every 10 minutes.
+  Announces carry this time as emission timestamp, and Python RNS only
+  accepts an announce for a known destination if it is newer than the last
+  one, so announces after a reboot were silently dropped. madpico sets the
+  clock from NTP before the first announce.
 - **Global `RNS::Reticulum`:** its default constructor logs via `Serial`.
   Created as a global object it runs before arduino-pico has initialised USB
   and the board hangs before `setup()`. It is created in `setup()` instead.

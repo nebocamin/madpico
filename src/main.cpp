@@ -115,16 +115,108 @@ static bool any_interface_online() {
 	return false;
 }
 
+// ---------------------------------------------------------------------------
+// Clock
+//
+// The Pico has no RTC. microReticulum's clock is "milliseconds since boot +
+// persisted offset", i.e. somewhere in 1970, and it can even jump back by up
+// to 10 minutes after a reboot because the offset is only persisted every
+// 10 minutes. Announces carry that time as emission timestamp, and Python RNS
+// transport nodes only accept an announce for a known destination if its
+// timestamp is newer than the last one. Without real time, announces after a
+// quick reboot are silently dropped by the network.
+// ---------------------------------------------------------------------------
+static constexpr time_t MIN_VALID_EPOCH = 1700000000;  // Nov 2023
+static bool clock_synced = false;
+static bool ntp_started = false;
+
+// Moves microReticulum's clock to NTP time (forward only). Returns true if
+// the clock was adjusted.
+static bool sync_clock() {
+	if (clock_synced || WiFi.status() != WL_CONNECTED) return false;
+	if (!ntp_started) {
+		NTP.begin(NTP_SERVER_1, NTP_SERVER_2);
+		ntp_started = true;
+	}
+	time_t now = time(nullptr);
+	if (now < MIN_VALID_EPOCH) return false;  // not synchronised yet
+	clock_synced = true;
+
+	const uint64_t ntp_ms = (uint64_t)now * 1000ULL;
+	const uint64_t rns_ms = RNS::Utilities::OS::ltime();
+	if (ntp_ms <= rns_ms) {
+		Serial.println("[time] Clock already ahead of NTP, not adjusting");
+		return false;
+	}
+	RNS::Utilities::OS::setTimeOffset(RNS::Utilities::OS::getTimeOffset() + (ntp_ms - rns_ms));
+	// Persist right away (same format as Reticulum::writeTimeOffset(), which
+	// is protected), so the clock stays sane after a reboot without NTP
+	uint64_t persisted = RNS::Utilities::OS::ltime();
+	RNS::Utilities::OS::write_file("./time_offset", RNS::Bytes((uint8_t*)&persisted, sizeof(persisted)));
+	Serial.printf("[time] Clock set from NTP: %lu (unix time)\n", (unsigned long)now);
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Announces
+// ---------------------------------------------------------------------------
+#define LAST_ANNOUNCE_PATH "/last_announce"
+static bool announced = false;  // last_announce_ms is valid
+
+static void persist_last_announce() {
+	if (!clock_synced) return;
+	uint64_t t = (uint64_t)time(nullptr);
+	fs::File f = LittleFS.open(LAST_ANNOUNCE_PATH, "w");
+	if (!f) return;
+	f.write((const uint8_t*)&t, sizeof(t));
+	f.close();
+}
+
+// Restores the time of the last announce (needs real time), so that reboots
+// don't cause extra announces
+static void restore_last_announce() {
+	if (!clock_synced) return;
+	fs::File f = LittleFS.open(LAST_ANNOUNCE_PATH, "r");
+	if (!f) return;
+	uint64_t t = 0;
+	bool ok = f.read((uint8_t*)&t, sizeof(t)) == sizeof(t);
+	f.close();
+	uint64_t now = (uint64_t)time(nullptr);
+	if (!ok || t == 0 || t > now) return;
+	uint64_t ago_ms = (now - t) * 1000ULL;
+	if (ago_ms >= ANNOUNCE_INTERVAL_MS) return;
+	// Unsigned wrap-around keeps "millis() - last_announce_ms" correct
+	last_announce_ms = millis() - (uint32_t)ago_ms;
+	announced = true;
+	Serial.printf("[rns] Last announce was %lu min ago\n", (unsigned long)(ago_ms / 60000));
+}
+
+static bool auto_announce_allowed() {
+	return !announced || millis() - last_announce_ms >= ANNOUNCE_MIN_GAP_MS;
+}
+
 static void announce() {
 	if (!any_interface_online()) {
-		// Don't count it as sent, so we announce right after (re)connecting
+		// Not counted as sent, so we announce right after (re)connecting
 		Serial.println("[rns] Announce postponed, no interface online");
 		return;
 	}
 	node_destination.announce(RNS::Bytes(NODE_NAME));
 	last_announce_ms = millis();
+	announced = true;
+	persist_last_announce();
 	Serial.printf("[rns] Announce sent: %s \"%s\"\n",
 		node_destination.hash().toHex().c_str(), NODE_NAME);
+}
+
+static void auto_announce(const char* reason) {
+	if (auto_announce_allowed()) {
+		announce();
+	}
+	else {
+		Serial.printf("[rns] Skipping announce (%s), last one was %lu min ago\n",
+			reason, (unsigned long)((millis() - last_announce_ms) / 60000));
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -329,7 +421,7 @@ static madpico::FileTransfer file_transfer(PAGES_DIR, MAX_PAGE_SIZE, register_pa
 static void print_status() {
 	Serial.printf("Uptime %lus, WiFi %s (%d dBm), TCP %s (%lu connects), free heap %d, "
 		"links %u active / %u pending (%lu total, %lu idle-closed, %lu limit-closed), "
-		"pages %u, requests %lu\n",
+		"pages %u, requests %lu, clock %s (rns time %lu)\n",
 		(unsigned long)(millis() / 1000),
 		WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "disconnected",
 		WiFi.RSSI(),
@@ -340,7 +432,9 @@ static void print_status() {
 		(unsigned)RNS::Transport::pending_links().size(),
 		(unsigned long)links_total, (unsigned long)links_closed_idle, (unsigned long)links_closed_limit,
 		(unsigned)registered_pages.size(),
-		(unsigned long)requests_served);
+		(unsigned long)requests_served,
+		clock_synced ? "NTP" : "not synced",
+		(unsigned long)RNS::Utilities::OS::time());
 }
 
 static void handle_serial() {
@@ -361,7 +455,14 @@ static void handle_serial() {
 		}
 		switch (c) {
 			case '!': in_line = true; line.clear(); break;
-			case 'a': if (node_destination) announce(); break;
+			case 'a':
+				if (!node_destination) break;
+				if (announced && millis() - last_announce_ms < ANNOUNCE_MIN_GAP_MS) {
+					Serial.println("[rns] Note: transport nodes rate-limit frequent announces; "
+						"too many get the node's announces dropped for a while");
+				}
+				announce();
+				break;
 			case 's': print_status(); break;
 			case 'w': wifi_scan(); break;
 			case 'c': WiFi.disconnect(); wifi_connect(20000); break;
@@ -396,6 +497,13 @@ static void setup_node() {
 	// CYW43), so try several rounds at startup
 	for (int round = 0; round < 3 && !wifi_connect(15000); ++round) delay(1000);
 
+	// Get real time before the first announce (see sync_clock())
+	if (WiFi.status() == WL_CONNECTED) {
+		NTP.begin(NTP_SERVER_1, NTP_SERVER_2);
+		ntp_started = true;
+		if (!NTP.waitSet(10000)) Serial.println("[time] NTP not answering yet, will keep trying");
+	}
+
 #if USE_UDP
 	udp_interface = new PicoUDPInterface(UDP_PORT);
 	RNS::Transport::register_interface(udp_interface);
@@ -417,6 +525,8 @@ static void setup_node() {
 	// the in-RAM tables would grow without bound on a public network.
 	RNS::Identity::known_destinations_maxsize(KNOWN_DESTINATIONS_MAX);
 	RNS::Transport::path_table_maxsize(PATH_TABLE_MAX);
+	// Must run after reticulum.start(), which loads the persisted time offset
+	sync_clock();
 
 	// Persistent node identity
 	node_identity = RNS::Identity::from_file(IDENTITY_PATH);
@@ -446,7 +556,9 @@ static void setup_node() {
 
 	Serial.printf("[rns] Node \"%s\" running, address %s\n",
 		NODE_NAME, node_destination.hash().toHex().c_str());
-	announce();
+	restore_last_announce();
+	tcp_seen_connects = tcp_impl ? tcp_impl->connect_count() : 0;
+	if (any_interface_online()) auto_announce("boot");
 }
 
 void setup() {
@@ -477,25 +589,30 @@ void loop() {
 		wifi_connect(10000);
 	}
 
-	if (node_destination && millis() - last_announce_ms > ANNOUNCE_INTERVAL_MS) {
-		announce();
-	}
-
-	// Announce after every TCP (re)connect, so the remote side (and the
-	// network behind it) learns a path to the node right away
-	if (tcp_impl && node_destination && tcp_impl->connect_count() != tcp_seen_connects) {
-		tcp_seen_connects = tcp_impl->connect_count();
-		if (last_announce_ms == 0 || millis() - last_announce_ms > RECONNECT_ANNOUNCE_MIN_MS) {
+	if (node_destination && any_interface_online()) {
+		// Periodic announce, or the first one once an interface is online
+		if (!announced || millis() - last_announce_ms >= ANNOUNCE_INTERVAL_MS) {
 			announce();
 		}
-		else {
-			Serial.println("[rns] TCP reconnected, announce skipped (last one is recent)");
+		// After a TCP reconnect the remote side may have lost the path,
+		// announce again (subject to the minimum gap)
+		if (tcp_impl && tcp_impl->connect_count() != tcp_seen_connects) {
+			tcp_seen_connects = tcp_impl->connect_count();
+			auto_announce("TCP reconnect");
 		}
 	}
 
 	if (millis() - last_link_check_ms > 2000) {
 		last_link_check_ms = millis();
 		enforce_link_limits();
+		// NTP failed at boot: keep trying. An announce sent with the old
+		// clock was likely dropped, so announce again once the time is right
+		// (unless the persisted last announce is recent).
+		if (!clock_synced && sync_clock() && node_destination) {
+			announced = false;
+			restore_last_announce();
+			auto_announce("clock synced");
+		}
 	}
 
 	handle_serial();
