@@ -25,14 +25,6 @@
 #ifndef ANNOUNCE_INTERVAL_MS
 #define ANNOUNCE_INTERVAL_MS (360UL * 60UL * 1000UL)
 #endif
-// Minimum gap between automatic announces (boot, TCP reconnect). Transport
-// nodes rate-limit announces per destination (typically ~1 per hour) and stop
-// rebroadcasting them for a while if a destination announces too often. The
-// time of the last announce is persisted, so reboots respect the gap too.
-// Clients can still reach the node in between via path requests.
-#ifndef ANNOUNCE_MIN_GAP_MS
-#define ANNOUNCE_MIN_GAP_MS (60UL * 60UL * 1000UL)
-#endif
 
 // --- Interfaces -------------------------------------------------------------
 // TCP client to a TCPServerInterface (e.g. rnsd or a public transport node)
@@ -81,6 +73,11 @@
 // Show WiFi SSID and local IP on the (public) status page?
 #ifndef STATUS_SHOW_NETWORK
 #define STATUS_SHOW_NETWORK 0
+#endif
+
+// Hardware watchdog: reboot if the main loop is stuck for this long
+#ifndef WATCHDOG_TIMEOUT_MS
+#define WATCHDOG_TIMEOUT_MS 8000
 #endif
 
 // --- Resource limits --------------------------------------------------------

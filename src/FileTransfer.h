@@ -172,6 +172,7 @@ private:
 			if (avail <= 0) {
 				if (millis() - last > DATA_TIMEOUT_MS) break;
 				delay(1);
+				rp2040.wdt_reset();
 				continue;
 			}
 			size_t want = size - received;

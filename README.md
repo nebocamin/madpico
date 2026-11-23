@@ -84,13 +84,13 @@ All options live in `src/secrets.h` (git-ignored); defaults are in
 | `NODE_NAME` | `madpico` | name shown in NomadNet |
 | `USE_TCP` / `USE_UDP` | 1 / 0 | enable interfaces |
 | `UDP_PORT` | 4242 | UDP broadcast port |
-| `ANNOUNCE_INTERVAL_MS` | 6 h | periodic announce |
-| `ANNOUNCE_MIN_GAP_MS` | 1 h | minimum gap for automatic announces (boot, TCP reconnect), persisted across reboots |
+| `ANNOUNCE_INTERVAL_MS` | 6 h | periodic announce (plus one after every TCP connect) |
 | `NTP_SERVER_1` / `NTP_SERVER_2` | `pool.ntp.org` / `time.cloudflare.com` | time source (required, see below) |
 | `STATUS_SHOW_NETWORK` | 0 | show SSID and local IP on the status page |
 | `MAX_PAGE_SIZE` | 16 KB | largest page served / accepted for upload |
 | `MAX_ACTIVE_LINKS` | 16 | links beyond this close the longest idle ones |
 | `LINK_IDLE_TIMEOUT_S` | 300 | close links without data (keepalives don't count) |
+| `WATCHDOG_TIMEOUT_MS` | 8000 | reboot if the main loop hangs |
 
 ### rnsd side
 
@@ -158,10 +158,14 @@ dropped for a while: they are no longer rebroadcast, so it doesn't show up
 in other people's NomadNet announce lists. Path requests still work, so the
 node stays reachable by address (`<address>:/page/index.mu`).
 
-madpico therefore announces every 6 hours and on boot / TCP reconnect only if
-the last announce is at least an hour old. The time of the last announce is
-stored in flash, so frequent reboots (e.g. while developing) don't cause extra
-announces. Avoid pressing `a` repeatedly.
+madpico announces every 6 hours and after every TCP (re)connect. The
+announce after a reconnect is required: a transport node forgets the path
+when the old connection goes away. Even when the node is rate-limited, the
+announce still updates the transport node's routing data, it just isn't
+rebroadcast. Note that a transport node does not create a *new* path entry
+from a rate-limited announce, so many reboots in a short time (e.g. while
+developing) can make the node unreachable until the penalty expires. Avoid
+pressing `a` repeatedly.
 
 ## Testing
 

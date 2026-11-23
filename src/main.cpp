@@ -24,6 +24,7 @@
 
 #include "config.h"
 #include "DefaultPages.h"
+#include "Diagnostics.h"
 #include "FileTransfer.h"
 #include "PicoEntropy.h"
 #include "PicoLittleFS.h"
@@ -44,6 +45,7 @@ static PicoTCPClientInterface* tcp_impl = nullptr;  // owned by tcp_interface
 static RNS::Identity node_identity({RNS::Type::NONE});
 static RNS::Destination node_destination({RNS::Type::NONE});
 static std::set<std::string> registered_pages;  // request paths, e.g. "/page/index.mu"
+static madpico::Diagnostics diag;
 
 static uint32_t tcp_seen_connects = 0;
 static uint32_t last_announce_ms = 0;
@@ -77,6 +79,7 @@ static bool wifi_connect(uint32_t timeout_ms) {
 		uint32_t start = millis();
 		while (WiFi.status() != WL_CONNECTED && millis() - start < timeout_ms) {
 			delay(100);
+			rp2040.wdt_reset();  // no-op before the watchdog is started
 		}
 		if (WiFi.status() == WL_CONNECTED) {
 			Serial.printf("[wifi] Connected to \"%s\", IP %s, RSSI %d dBm\n",
@@ -160,40 +163,11 @@ static bool sync_clock() {
 // ---------------------------------------------------------------------------
 // Announces
 // ---------------------------------------------------------------------------
-#define LAST_ANNOUNCE_PATH "/last_announce"
+// Announce after every TCP (re)connect: a Python transport node drops the
+// path when the old connection goes away and only learns the new one from
+// an announce. If the node is rate-limited, the announce still updates the
+// routing data, it just isn't rebroadcast.
 static bool announced = false;  // last_announce_ms is valid
-
-static void persist_last_announce() {
-	if (!clock_synced) return;
-	uint64_t t = (uint64_t)time(nullptr);
-	fs::File f = LittleFS.open(LAST_ANNOUNCE_PATH, "w");
-	if (!f) return;
-	f.write((const uint8_t*)&t, sizeof(t));
-	f.close();
-}
-
-// Restores the time of the last announce (needs real time), so that reboots
-// don't cause extra announces
-static void restore_last_announce() {
-	if (!clock_synced) return;
-	fs::File f = LittleFS.open(LAST_ANNOUNCE_PATH, "r");
-	if (!f) return;
-	uint64_t t = 0;
-	bool ok = f.read((uint8_t*)&t, sizeof(t)) == sizeof(t);
-	f.close();
-	uint64_t now = (uint64_t)time(nullptr);
-	if (!ok || t == 0 || t > now) return;
-	uint64_t ago_ms = (now - t) * 1000ULL;
-	if (ago_ms >= ANNOUNCE_INTERVAL_MS) return;
-	// Unsigned wrap-around keeps "millis() - last_announce_ms" correct
-	last_announce_ms = millis() - (uint32_t)ago_ms;
-	announced = true;
-	Serial.printf("[rns] Last announce was %lu min ago\n", (unsigned long)(ago_ms / 60000));
-}
-
-static bool auto_announce_allowed() {
-	return !announced || millis() - last_announce_ms >= ANNOUNCE_MIN_GAP_MS;
-}
 
 static void announce() {
 	if (!any_interface_online()) {
@@ -204,19 +178,8 @@ static void announce() {
 	node_destination.announce(RNS::Bytes(NODE_NAME));
 	last_announce_ms = millis();
 	announced = true;
-	persist_last_announce();
 	Serial.printf("[rns] Announce sent: %s \"%s\"\n",
 		node_destination.hash().toHex().c_str(), NODE_NAME);
-}
-
-static void auto_announce(const char* reason) {
-	if (auto_announce_allowed()) {
-		announce();
-	}
-	else {
-		Serial.printf("[rns] Skipping announce (%s), last one was %lu min ago\n",
-			reason, (unsigned long)((millis() - last_announce_ms) / 60000));
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -419,7 +382,7 @@ static madpico::FileTransfer file_transfer(PAGES_DIR, MAX_PAGE_SIZE, register_pa
 //   lines starting with '!': file transfer protocol (see FileTransfer.h)
 // ---------------------------------------------------------------------------
 static void print_status() {
-	Serial.printf("Uptime %lus, WiFi %s (%d dBm), TCP %s (%lu connects), free heap %d, "
+	Serial.printf("Uptime %lus, WiFi %s (%d dBm), TCP %s (%lu connects), free heap %d (min %lu), "
 		"links %u active / %u pending (%lu total, %lu idle-closed, %lu limit-closed), "
 		"pages %u, requests %lu, clock %s (rns time %lu)\n",
 		(unsigned long)(millis() / 1000),
@@ -427,7 +390,7 @@ static void print_status() {
 		WiFi.RSSI(),
 		tcp_impl ? (tcp_impl->connected() ? "connected" : "disconnected") : "off",
 		(unsigned long)(tcp_impl ? tcp_impl->connect_count() : 0),
-		rp2040.getFreeHeap(),
+		rp2040.getFreeHeap(), (unsigned long)diag.min_heap(),
 		(unsigned)RNS::Transport::active_links().size(),
 		(unsigned)RNS::Transport::pending_links().size(),
 		(unsigned long)links_total, (unsigned long)links_closed_idle, (unsigned long)links_closed_limit,
@@ -457,13 +420,19 @@ static void handle_serial() {
 			case '!': in_line = true; line.clear(); break;
 			case 'a':
 				if (!node_destination) break;
-				if (announced && millis() - last_announce_ms < ANNOUNCE_MIN_GAP_MS) {
+				if (announced && millis() - last_announce_ms < 60UL * 60UL * 1000UL) {
 					Serial.println("[rns] Note: transport nodes rate-limit frequent announces; "
 						"too many get the node's announces dropped for a while");
 				}
 				announce();
 				break;
-			case 's': print_status(); break;
+			case 's':
+				print_status();
+				// Table sizes (needs -DRNS_DEBUG_METRICS)
+				RNS::loglevel(RNS::LOG_VERBOSE);
+				RNS::Transport::dump_stats();
+				RNS::loglevel(RNS::LOG_NOTICE);
+				break;
 			case 'w': wifi_scan(); break;
 			case 'c': WiFi.disconnect(); wifi_connect(20000); break;
 			case 'r':
@@ -556,9 +525,8 @@ static void setup_node() {
 
 	Serial.printf("[rns] Node \"%s\" running, address %s\n",
 		NODE_NAME, node_destination.hash().toHex().c_str());
-	restore_last_announce();
 	tcp_seen_connects = tcp_impl ? tcp_impl->connect_count() : 0;
-	if (any_interface_online()) auto_announce("boot");
+	if (any_interface_online()) announce();
 }
 
 void setup() {
@@ -571,6 +539,7 @@ void setup() {
 
 	Serial.println();
 	Serial.printf("=== madpico %s - NomadNet page node ===\n", FW_VERSION);
+	diag.report_previous_run();
 	try {
 		setup_node();
 	}
@@ -579,43 +548,67 @@ void setup() {
 	}
 	Serial.println("Serial commands: a = announce, s = status, w = WiFi scan, c = reconnect WiFi,");
 	Serial.println("                 r = rewrite default pages + reboot");
+
+	// Reboot automatically if the main loop hangs. The diagnostics report
+	// the reset reason and the last loop stage on the next boot.
+	rp2040.wdt_begin(WATCHDOG_TIMEOUT_MS);
 }
 
-void loop() {
+static void loop_work() {
+	diag.stage(madpico::STAGE_RETICULUM);
 	reticulum.loop();
 
 	// WiFi reconnect (the interfaces restart themselves afterwards)
+	diag.stage(madpico::STAGE_WIFI);
 	if (WiFi.status() != WL_CONNECTED && millis() - last_wifi_attempt_ms > WIFI_RETRY_MS) {
 		wifi_connect(10000);
 	}
 
+	diag.stage(madpico::STAGE_ANNOUNCE);
 	if (node_destination && any_interface_online()) {
 		// Periodic announce, or the first one once an interface is online
 		if (!announced || millis() - last_announce_ms >= ANNOUNCE_INTERVAL_MS) {
 			announce();
 		}
-		// After a TCP reconnect the remote side may have lost the path,
-		// announce again (subject to the minimum gap)
+		// After a TCP reconnect the remote side has lost the path
 		if (tcp_impl && tcp_impl->connect_count() != tcp_seen_connects) {
 			tcp_seen_connects = tcp_impl->connect_count();
-			auto_announce("TCP reconnect");
+			announce();
 		}
 	}
 
+	diag.stage(madpico::STAGE_LINKS);
 	if (millis() - last_link_check_ms > 2000) {
 		last_link_check_ms = millis();
 		enforce_link_limits();
 		// NTP failed at boot: keep trying. An announce sent with the old
-		// clock was likely dropped, so announce again once the time is right
-		// (unless the persisted last announce is recent).
+		// clock was likely dropped, so announce again once the time is right.
 		if (!clock_synced && sync_clock() && node_destination) {
-			announced = false;
-			restore_last_announce();
-			auto_announce("clock synced");
+			announce();
 		}
 	}
 
+	diag.stage(madpico::STAGE_SERIAL);
 	handle_serial();
+}
+
+void loop() {
+	// Anything thrown outside reticulum.loop() (which catches its own
+	// exceptions) would otherwise end in std::terminate and a reset
+	try {
+		loop_work();
+	}
+	catch (const std::bad_alloc&) {
+		Serial.printf("[diag] OUT OF MEMORY in stage %lu, free heap %d\n",
+			(unsigned long)watchdog_hw->scratch[3], rp2040.getFreeHeap());
+	}
+	catch (const std::exception& e) {
+		Serial.printf("[diag] Exception in stage %lu: %s\n",
+			(unsigned long)watchdog_hw->scratch[3], e.what());
+	}
+	diag.stage(madpico::STAGE_IDLE);
+	diag.update();
+	rp2040.wdt_reset();
 
 	// LED: on = online, slow blink = WiFi ok but TCP down, fast blink = no WiFi
 	bool wifi_ok = (WiFi.status() == WL_CONNECTED);
