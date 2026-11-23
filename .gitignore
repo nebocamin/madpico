@@ -1,0 +1,7 @@
+.pio/
+.vscode/
+__pycache__/
+*.pyc
+
+# Local settings with WiFi credentials
+src/secrets.h
