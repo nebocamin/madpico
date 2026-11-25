@@ -6,7 +6,8 @@
 # If the Pico doesn't respond (e.g. crashed firmware), plug it in while
 # holding BOOTSEL and run this script again.
 #
-# Environment: PIO (pio binary), PORT (serial port), MNT (RP2350 mount point)
+# Environment: ENV (PlatformIO environment, default pico2w), PIO (pio binary),
+#              PORT (serial port), MNT (RP2350 mount point)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -14,8 +15,9 @@ PIO=${PIO:-$(command -v pio || echo "$HOME/.local/bin/pio")}
 PY=$(dirname "$(readlink -f "$PIO")")/python
 PORT=${PORT:-/dev/ttyACM0}
 MNT=${MNT:-/run/media/$USER/RP2350}
+ENV=${ENV:-pico2w}
 
-"$PIO" run
+"$PIO" run -e "$ENV"
 
 if [ ! -e "$MNT/INFO_UF2.TXT" ]; then
 	if [ -e "$PORT" ]; then
@@ -25,6 +27,6 @@ if [ ! -e "$MNT/INFO_UF2.TXT" ]; then
 fi
 [ -e "$MNT/INFO_UF2.TXT" ] || { echo "Pico is not in the bootloader - plug it in while holding BOOTSEL"; exit 1; }
 
-cp .pio/build/pico2w/firmware.uf2 "$MNT/" && sync
+cp ".pio/build/$ENV/firmware.uf2" "$MNT/" && sync
 for _ in $(seq 1 20); do [ -e "$PORT" ] && break; sleep 1; done
 echo "Flashed, serial port: $PORT"

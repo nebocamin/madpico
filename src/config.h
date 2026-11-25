@@ -26,6 +26,14 @@
 #define ANNOUNCE_INTERVAL_MS (360UL * 60UL * 1000UL)
 #endif
 
+// --- Uplink -----------------------------------------------------------------
+// USB networking: the Pico appears as a USB network adapter (CDC-NCM) and
+// uses the host's connection (e.g. NetworkManager "Shared to other
+// computers"). WiFi is not used in this mode. Build with: pio run -e pico2w-usbnet
+#ifndef USE_USB_NET
+#define USE_USB_NET 0
+#endif
+
 // --- Interfaces -------------------------------------------------------------
 // TCP client to a TCPServerInterface (e.g. rnsd or a public transport node)
 #ifndef USE_TCP

@@ -23,6 +23,8 @@ static pages.
   broadcast interface
 - Persistent node identity, keys generated from the RP2350 hardware TRNG
 - Automatic WiFi and TCP reconnect, fallback WiFi networks
+- Optional USB networking: the Pico appears as a USB network adapter and uses
+  the laptop's connection (handy on a train)
 - Link limit and idle timeout, so crawlers on public networks can't exhaust
   the RAM
 
@@ -83,6 +85,7 @@ All options live in `src/secrets.h` (git-ignored); defaults are in
 | `TCP_TARGET_HOST` / `TCP_TARGET_PORT` | - / 4242 | TCPServerInterface to connect to |
 | `NODE_NAME` | `madpico` | name shown in NomadNet |
 | `USE_TCP` / `USE_UDP` | 1 / 0 | enable interfaces |
+| `USE_USB_NET` | 0 | uplink via USB networking instead of WiFi (set by the `pico2w-usbnet` environment) |
 | `UDP_PORT` | 4242 | UDP broadcast port |
 | `ANNOUNCE_INTERVAL_MS` | 6 h | periodic announce (plus one after every TCP connect) |
 | `NTP_SERVER_1` / `NTP_SERVER_2` | `pool.ntp.org` / `time.cloudflare.com` | time source (required, see below) |
@@ -112,6 +115,40 @@ For the optional UDP interface (`USE_UDP 1`), use a matching `UDPInterface`
 with `forward_ip` set to your subnet's broadcast address. Note that WiFi
 broadcasts are not acknowledged on the radio layer, so occasional packet loss
 is expected; TCP is more reliable.
+
+## USB networking
+
+Instead of WiFi, the Pico can use the network connection of the computer it
+is plugged into. It then appears as a USB network adapter (CDC-NCM) next to
+the serial console, so `tools/madpico.py` keeps working. The TCP interface,
+NTP and everything else run unchanged over USB.
+
+Build and flash the USB variant:
+
+```sh
+pio run -e pico2w-usbnet
+ENV=pico2w-usbnet tools/flash.sh
+```
+
+The host has to provide DHCP and NAT for the adapter. With NetworkManager
+(Linux), find the new interface (`ip link`, named `enx<mac>`) and share your
+connection with it:
+
+```sh
+nmcli con add type ethernet con-name madpico-usb ifname enx<mac> \
+    ipv4.method shared ipv6.method disabled connection.autoconnect-priority 50
+nmcli con up madpico-usb
+```
+
+The Pico gets an address in 10.42.0.0/24 and reaches the internet through the
+host, whatever the host is connected to. In testing, the interface name stayed
+the same across reboots, and the shared connection survived the host switching
+WiFi networks. Latency between host and Pico is about 3 ms.
+
+Windows (Internet Connection Sharing) and macOS (Internet Sharing) support
+CDC-NCM as well, but this is untested. Android phones are unlikely to work:
+the phone would have to share its connection *to* a USB Ethernet adapter,
+which only some devices support.
 
 ## Managing pages
 
@@ -148,7 +185,8 @@ Single characters typed into the serial console:
 | `c` | reconnect WiFi |
 | `r` | rewrite the default pages and reboot |
 
-LED: on = online, slow blink = WiFi ok but TCP disconnected, fast blink = no WiFi.
+LED: on = online, slow blink = uplink ok but TCP disconnected, fast blink = no
+uplink. `w` and `c` are not available in the USB networking build.
 
 ### Announces and rate limits
 

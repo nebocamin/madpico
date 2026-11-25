@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// TCP client interface for microReticulum on the Pico 2 W (arduino-pico WiFi).
+// TCP client interface for microReticulum on the Pico 2 W (arduino-pico lwIP,
+// works over WiFi and USB networking).
 //
 // Wire compatible with TCPClientInterface / TCPServerInterface of Python RNS:
 // HDLC-like framing (FLAG 0x7E, ESC 0x7D, ESC_MASK 0x20), one Reticulum packet
@@ -16,7 +17,6 @@
 #pragma once
 
 #include <Arduino.h>
-#include <WiFi.h>
 #include <WiFiClient.h>
 
 #include <microReticulum/Interface.h>
@@ -26,6 +26,8 @@
 
 #include <string>
 #include <vector>
+
+#include "Net.h"
 
 class PicoTCPClientInterface : public RNS::InterfaceImpl {
 
@@ -139,7 +141,7 @@ protected:
 private:
 	void try_connect() {
 		_last_attempt_ms = millis();
-		if (WiFi.status() != WL_CONNECTED) return;
+		if (!madpico::net_up()) return;
 		_client.stop();
 		_client.setTimeout(CONNECT_TIMEOUT_MS);
 		if (!_client.connect(_host.c_str(), _port)) {

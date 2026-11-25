@@ -24,12 +24,38 @@
 
 #include "config.h"
 #include "DefaultPages.h"
+#include "Net.h"
 #include "Diagnostics.h"
 #include "FileTransfer.h"
 #include "PicoEntropy.h"
 #include "PicoLittleFS.h"
 #include "PicoTCPClientInterface.h"
 #include "PicoUDPInterface.h"
+
+#if USE_USB_NET
+#include <NCMEthernetlwIP.h>
+static NCMEthernetlwIP usbnet;
+#endif
+
+bool madpico::net_up() {
+#if USE_USB_NET
+	return usbnet.connected();
+#else
+	return WiFi.status() == WL_CONNECTED;
+#endif
+}
+
+// Short description of the uplink for logs and the status page
+static String uplink_info(bool show_address) {
+#if USE_USB_NET
+	if (!usbnet.connected()) return "USB network, no IP";
+	return show_address ? "USB network, IP " + usbnet.localIP().toString() : String("USB network");
+#else
+	if (WiFi.status() != WL_CONNECTED) return "WiFi disconnected";
+	String s = show_address ? "WiFi \"" + WiFi.SSID() + "\", IP " + WiFi.localIP().toString() + ", " : String("WiFi ");
+	return s + String(WiFi.RSSI()) + " dBm";
+#endif
+}
 
 // ---------------------------------------------------------------------------
 // Global state
@@ -136,7 +162,7 @@ static bool ntp_started = false;
 // Moves microReticulum's clock to NTP time (forward only). Returns true if
 // the clock was adjusted.
 static bool sync_clock() {
-	if (clock_synced || WiFi.status() != WL_CONNECTED) return false;
+	if (clock_synced || !madpico::net_up()) return false;
 	if (!ntp_started) {
 		NTP.begin(NTP_SERVER_1, NTP_SERVER_2);
 		ntp_started = true;
@@ -284,13 +310,7 @@ static RNS::Bytes serve_status_page(const RNS::Bytes& path, const RNS::Bytes& da
 	ifaces += "UDP broadcast :" + std::to_string(UDP_PORT);
 #endif
 
-	char wifi[96];
-#if STATUS_SHOW_NETWORK
-	snprintf(wifi, sizeof(wifi), "%s, %d dBm, IP %s",
-		WiFi.SSID().c_str(), WiFi.RSSI(), WiFi.localIP().toString().c_str());
-#else
-	snprintf(wifi, sizeof(wifi), "%d dBm", WiFi.RSSI());
-#endif
+	String uplink = uplink_info(STATUS_SHOW_NETWORK);
 
 	char page[1024];
 	snprintf(page, sizeof(page),
@@ -301,7 +321,7 @@ static RNS::Bytes serve_status_page(const RNS::Bytes& path, const RNS::Bytes& da
 		"`!Uptime`!     %lud %02lu:%02lu:%02lu\n"
 		"`!Free heap`!  %d / %d bytes\n"
 		"`!Flash (FS)`! %lu / %lu bytes used\n"
-		"`!WiFi`!       %s\n"
+		"`!Uplink`!     %s\n"
 		"`!Interface`!  %s\n"
 		"`!Links`!      %u active (max %u), %lu total\n"
 		"`!CPU`!        RP2350 @ %lu MHz, %d.%d C\n"
@@ -315,7 +335,7 @@ static RNS::Bytes serve_status_page(const RNS::Bytes& path, const RNS::Bytes& da
 		(unsigned long)(up / 60 % 60), (unsigned long)(up % 60),
 		rp2040.getFreeHeap(), rp2040.getTotalHeap(),
 		(unsigned long)fsinfo.usedBytes, (unsigned long)fsinfo.totalBytes,
-		wifi,
+		uplink.c_str(),
 		ifaces.c_str(),
 		(unsigned)RNS::Transport::active_links().size(), (unsigned)MAX_ACTIVE_LINKS,
 		(unsigned long)links_total,
@@ -382,12 +402,11 @@ static madpico::FileTransfer file_transfer(PAGES_DIR, MAX_PAGE_SIZE, register_pa
 //   lines starting with '!': file transfer protocol (see FileTransfer.h)
 // ---------------------------------------------------------------------------
 static void print_status() {
-	Serial.printf("Uptime %lus, WiFi %s (%d dBm), TCP %s (%lu connects), free heap %d (min %lu), "
+	Serial.printf("Uptime %lus, %s, TCP %s (%lu connects), free heap %d (min %lu), "
 		"links %u active / %u pending (%lu total, %lu idle-closed, %lu limit-closed), "
 		"pages %u, requests %lu, clock %s (rns time %lu)\n",
 		(unsigned long)(millis() / 1000),
-		WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "disconnected",
-		WiFi.RSSI(),
+		uplink_info(true).c_str(),
 		tcp_impl ? (tcp_impl->connected() ? "connected" : "disconnected") : "off",
 		(unsigned long)(tcp_impl ? tcp_impl->connect_count() : 0),
 		rp2040.getFreeHeap(), (unsigned long)diag.min_heap(),
@@ -433,8 +452,10 @@ static void handle_serial() {
 				RNS::Transport::dump_stats();
 				RNS::loglevel(RNS::LOG_NOTICE);
 				break;
+#if !USE_USB_NET
 			case 'w': wifi_scan(); break;
 			case 'c': WiFi.disconnect(); wifi_connect(20000); break;
+#endif
 			case 'r':
 				Serial.println("Rewriting default pages and rebooting ...");
 				ensure_default_pages(true);
@@ -462,12 +483,33 @@ static void setup_node() {
 	pico_seed_rng();
 	RNS::loglevel(RNS::LOG_NOTICE);
 
+#if USE_USB_NET
+	// The host has to provide DHCP and NAT, e.g. NetworkManager's
+	// "Shared to other computers" mode
+	usbnet.setDefault(true);
+	if (!usbnet.begin()) {
+		Serial.println("[usb] Starting USB network failed");
+	}
+	else {
+		Serial.println("[usb] USB network adapter started, waiting for DHCP from the host ...");
+		uint32_t t0 = millis();
+		while (!usbnet.connected() && millis() - t0 < 30000) delay(100);
+		if (usbnet.connected()) {
+			Serial.printf("[usb] Got IP %s, gateway %s\n", usbnet.localIP().toString().c_str(),
+				usbnet.gatewayIP().toString().c_str());
+		}
+		else {
+			Serial.println("[usb] No IP yet (is connection sharing enabled on the host?)");
+		}
+	}
+#else
 	// The first join right after boot often fails (freshly initialised
 	// CYW43), so try several rounds at startup
 	for (int round = 0; round < 3 && !wifi_connect(15000); ++round) delay(1000);
+#endif
 
 	// Get real time before the first announce (see sync_clock())
-	if (WiFi.status() == WL_CONNECTED) {
+	if (madpico::net_up()) {
 		NTP.begin(NTP_SERVER_1, NTP_SERVER_2);
 		ntp_started = true;
 		if (!NTP.waitSet(10000)) Serial.println("[time] NTP not answering yet, will keep trying");
@@ -560,9 +602,11 @@ static void loop_work() {
 
 	// WiFi reconnect (the interfaces restart themselves afterwards)
 	diag.stage(madpico::STAGE_WIFI);
+#if !USE_USB_NET
 	if (WiFi.status() != WL_CONNECTED && millis() - last_wifi_attempt_ms > WIFI_RETRY_MS) {
 		wifi_connect(10000);
 	}
+#endif
 
 	diag.stage(madpico::STAGE_ANNOUNCE);
 	if (node_destination && any_interface_online()) {
@@ -610,10 +654,10 @@ void loop() {
 	diag.update();
 	rp2040.wdt_reset();
 
-	// LED: on = online, slow blink = WiFi ok but TCP down, fast blink = no WiFi
-	bool wifi_ok = (WiFi.status() == WL_CONNECTED);
+	// LED: on = online, slow blink = uplink ok but TCP down, fast blink = no uplink
+	bool net_ok = madpico::net_up();
 	bool tcp_ok = !tcp_impl || tcp_impl->connected();
-	digitalWrite(LED_BUILTIN, (wifi_ok && tcp_ok) ? HIGH :
-		wifi_ok ? (millis() / 1000) % 2 : (millis() / 200) % 2);
+	digitalWrite(LED_BUILTIN, (net_ok && tcp_ok) ? HIGH :
+		net_ok ? (millis() / 1000) % 2 : (millis() / 200) % 2);
 	delay(1);
 }
